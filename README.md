@@ -10,6 +10,8 @@ Lab1:
 АмНям
 ![photo_5_2026-02-19_14-24-43](https://github.com/user-attachments/assets/811ea926-b1f8-4fcb-9b23-f0ba2b919e77)
 Lab2:
+
+
 https://github.com/user-attachments/assets/7e01dc47-f3d2-4cdb-b9d9-ed78b75cd08c
 
 
