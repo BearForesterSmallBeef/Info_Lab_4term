@@ -27,9 +27,9 @@ int main(int argc, char* argv[])
     {
         fem::CoordinateElement<U> cmap(mesh::CellType::tetrahedron, 1);
 
-        // --- 1. Читаем ОБЪЕМНУЮ сетку ---
+        // читаем сетку
         io::XDMFFile file_vol(MPI_COMM_WORLD, "mesh/sphere_volume.xdmf", "r");
-        // read_mesh имеет дефолтный 4-й аргумент (xpath="/Xdmf/Domain"), поэтому 3 аргумента тут работают
+        // XPath ("/Xdmf/Domain")
         auto mesh = std::make_shared<mesh::Mesh<U>>(
             file_vol.read_mesh(cmap, mesh::GhostMode::shared_facet, "Grid")
         );
@@ -37,9 +37,9 @@ int main(int argc, char* argv[])
         mesh->topology()->create_entities(2); 
         mesh->topology()->create_connectivity(2, 3);
 
-        // --- 2. Читаем ПОВЕРХНОСТНЫЕ теги (Facet Tags) ---
+        // читаем теги сферы
         io::XDMFFile file_facets(MPI_COMM_WORLD, "mesh/sphere_facets.xdmf", "r");
-        // А вот read_meshtags требует строго 4 аргумента:
+        // read_meshtags требует строго 4 аргумента:
         // 1. Сетка (*mesh)
         // 2. Имя Grid ("Grid")
         // 3. Имя Attribute (явно указываем std::string, чтобы компилятор понял тип)
@@ -49,49 +49,50 @@ int main(int argc, char* argv[])
 
 
         // Пространства функций
+        // пространство для скорости
         auto basix_V = basix::create_element<U>(
             basix::element::family::P, basix::cell::type::tetrahedron, 2,
             basix::element::lagrange_variant::unset, basix::element::dpc_variant::unset, false);
         auto element_V = std::make_shared<fem::FiniteElement<U>>(basix_V, std::vector<std::size_t>{3}, false);
         auto V = std::make_shared<fem::FunctionSpace<U>>(fem::create_functionspace<U>(mesh, element_V));
-
+        // пространство для давления
         auto basix_Q = basix::create_element<U>(
             basix::element::family::P, basix::cell::type::tetrahedron, 1,
             basix::element::lagrange_variant::unset, basix::element::dpc_variant::unset, false);
         auto element_Q = std::make_shared<fem::FiniteElement<U>>(basix_Q, std::vector<std::size_t>{}, false);
         auto Q = std::make_shared<fem::FunctionSpace<U>>(fem::create_functionspace<U>(mesh, element_Q));
-
+        // задаем функции нужные для шагов
         auto u_n = std::make_shared<fem::Function<T>>(V);
         auto u_s = std::make_shared<fem::Function<T>>(V);
         auto u_next = std::make_shared<fem::Function<T>>(V);
         auto p_n = std::make_shared<fem::Function<T>>(Q);
         auto p_s = std::make_shared<fem::Function<T>>(Q);
-
-        auto dt = std::make_shared<fem::Constant<T>>(0.001);
+        // задаем константы
+        auto dt = std::make_shared<fem::Constant<T>>(0.003);
         auto rho = std::make_shared<fem::Constant<T>>(1.0); // Плотность воздуха, кг/м^3
-        auto mu = std::make_shared<fem::Constant<T>>(0.000018);
-
+        auto mu = std::make_shared<fem::Constant<T>>(0.05);
+        // костыль - мы создаем доп пространство для сохранения скоростей для визуализации, тк паравиев с параболами дружить отказался 
         auto basix_V_vis = basix::create_element<U>(
             basix::element::family::P, basix::cell::type::tetrahedron, 1,
             basix::element::lagrange_variant::unset, basix::element::dpc_variant::unset, false);
         auto element_V_vis = std::make_shared<fem::FiniteElement<U>>(basix_V_vis, std::vector<std::size_t>{3}, false);
         auto V_vis = std::make_shared<fem::FunctionSpace<U>>(fem::create_functionspace<U>(mesh, element_V_vis));
         
-        // Функция для сохранения скорости
+        // функция для сохранения скорости
         auto u_vis = std::make_shared<fem::Function<T>>(V_vis);
         u_vis->name = "Velocity"; 
         p_n->name = "Pressure"; 
 
-        // Граничные условия (Создаем как объекты, как в elasticity.cpp!)
+        // граничные условия
         auto u_inlet = std::make_shared<fem::Function<T>>(V);
         u_inlet->interpolate([](auto x) -> std::pair<std::vector<T>, std::vector<std::size_t>> {
             std::size_t N = x.extent(1);
             std::vector<T> v(3 * N, 0.0);
 
-            double W = 0.6; // Ширина по Y
-            double H = 0.6; // Высота по Z
-            double u_max = 1.5; // Максимальная скорость в центре (чтобы средняя была около 1.0)
-
+            double W = 0.6; // ширина по Y
+            double H = 0.6; // высота по Z
+            double u_max = 1.5; // максимальная скорость в центре
+            // парабола
             for (std::size_t i = 0; i < N; ++i){
                 double y = x(1, i);
                 double z = x(2, i);
@@ -105,7 +106,7 @@ int main(int argc, char* argv[])
         auto inlet_dofs = fem::locate_dofs_topological(*V->mesh()->topology_mutable(), *V->dofmap(), 2, facet_tags.find(1));
         fem::DirichletBC<T> bc_inlet(u_inlet, inlet_dofs);
         
-
+        // на границах скорость зануляем
         auto u_zero = std::make_shared<fem::Function<T>>(V);
         u_zero->interpolate([](auto x) -> std::pair<std::vector<T>, std::vector<std::size_t>> {
             return {std::vector<T>(3 * x.extent(1), 0.0), {3, x.extent(1)}};
@@ -117,7 +118,7 @@ int main(int argc, char* argv[])
         noslip_facets.insert(noslip_facets.end(), sphere_facets.begin(), sphere_facets.end());
         auto noslip_dofs = fem::locate_dofs_topological(*V->mesh()->topology_mutable(), *V->dofmap(), 2, noslip_facets);
         fem::DirichletBC<T> bc_noslip(u_zero, noslip_dofs);
-
+        // устанавливаем нулевое давление на вылете из трубы
         auto p_zero = std::make_shared<fem::Function<T>>(Q);
         p_zero->interpolate([](auto x) -> std::pair<std::vector<T>, std::vector<std::size_t>> {
             return {std::vector<T>(x.extent(1), 0.0), {1, x.extent(1)}};
@@ -125,14 +126,15 @@ int main(int argc, char* argv[])
         auto outlet_dofs = fem::locate_dofs_topological(*Q->mesh()->topology_mutable(), *Q->dofmap(), 2, facet_tags.find(2));
         fem::DirichletBC<T> bc_outlet(p_zero, outlet_dofs);
 
+        // тест что сетка хорошо прочиталась
         std::cout << "Узлов на входе (Inlet): " << inlet_dofs.size() << std::endl;
         std::cout << "Узлов на стенках и сфере: " << noslip_dofs.size() << std::endl;
 
-        // Формы (Создаем как объекты, передавая константную сетку mesh_const)
+        // конектимся с питончиком
         auto mesh_const = std::shared_ptr<const mesh::Mesh<U>>(mesh);
         auto V_const = std::shared_ptr<const fem::FunctionSpace<U>>(V);
         auto Q_const = std::shared_ptr<const fem::FunctionSpace<U>>(Q);
-
+        // создаем словари с нашими переменными
         std::map<std::string, std::shared_ptr<const fem::Function<T>>> coeffs = {
             {"u_n", std::shared_ptr<const fem::Function<T>>(u_n)},
             {"u_s", std::shared_ptr<const fem::Function<T>>(u_s)},
@@ -144,7 +146,7 @@ int main(int argc, char* argv[])
             {"rho", std::shared_ptr<const fem::Constant<T>>(rho)},
             {"mu", std::shared_ptr<const fem::Constant<T>>(mu)}
         };
-
+        // вот тут делаем указатели на предсозданый UFL код
         fem::Form<T> a1 = fem::create_form<T>(*form_navier_stokes_chorin_a1, {V_const, V_const}, coeffs, consts, {}, {}, mesh_const);
         fem::Form<T> L1 = fem::create_form<T>(*form_navier_stokes_chorin_L1, {V_const}, coeffs, consts, {}, {}, mesh_const);
 
@@ -154,7 +156,7 @@ int main(int argc, char* argv[])
         fem::Form<T> a3 = fem::create_form<T>(*form_navier_stokes_chorin_a3, {V_const, V_const}, coeffs, consts, {}, {}, mesh_const);
         fem::Form<T> L3 = fem::create_form<T>(*form_navier_stokes_chorin_L3, {V_const}, coeffs, consts, {}, {}, mesh_const);
 
-        // Сборка матриц
+        // cборка матриц для решателя
         la::petsc::Matrix A1(fem::petsc::create_matrix(a1), false);
         MatZeroEntries(A1.mat());
         fem::assemble_matrix(la::petsc::Matrix::set_block_fn(A1.mat(), ADD_VALUES), a1, {bc_inlet, bc_noslip});
@@ -175,43 +177,50 @@ int main(int argc, char* argv[])
         MatAssemblyBegin(A3.mat(), MAT_FLUSH_ASSEMBLY); MatAssemblyEnd(A3.mat(), MAT_FLUSH_ASSEMBLY);
         fem::set_diagonal<T>(la::petsc::Matrix::set_fn(A3.mat(), INSERT_VALUES), *V, {bc_inlet, bc_noslip});
         MatAssemblyBegin(A3.mat(), MAT_FINAL_ASSEMBLY); MatAssemblyEnd(A3.mat(), MAT_FINAL_ASSEMBLY);
-
+        // настройки солеверов
+        // матрица A1 несимметрична из-за конвекции
+        // поэтому используем "bcgs" (BiCGSTAB — метод бисопряженных градиентов со стабилизацией)
+        // предобуславливатель (штука, которая упрощает матрицу перед решением) — "bjacobi" (Блочный Якоби), он отлично работает параллельно - просто чото крутое вроде
         la::petsc::KrylovSolver solver1(MPI_COMM_WORLD); solver1.set_operator(A1.mat());
         la::petsc::options::set("ksp_type", "bcgs"); la::petsc::options::set("pc_type", "bjacobi"); solver1.set_from_options();
-        
+        // уравнение Пуассона дает красивую, идеально симметричную матрицу A2
+        // поэтому здесь используется "cg" (Метод сопряженных градиентов — самый быстрый для таких матриц)
+        // а вот предобуславливатель "hypre" — это алгебраический многосеточный метод (AMG) - шобы быстрее считалось
         la::petsc::KrylovSolver solver2(MPI_COMM_WORLD); solver2.set_operator(A2.mat());
-        la::petsc::options::set("ksp_type", "cg"); la::petsc::options::set("pc_type", "hypre"); solver2.set_from_options();
-        
+        la::petsc::options::set("ksp_type", "bcgs"); la::petsc::options::set("pc_type", "hypre"); solver2.set_from_options();
+        // матрица A3 тоже симметрична ("cg")
+        // сама по себе эта система очень простая (в a3 у нас только inner(u,v)), поэтому тут достаточно самого базового предобуславливателя "jacobi"
         la::petsc::KrylovSolver solver3(MPI_COMM_WORLD); solver3.set_operator(A3.mat());
-        la::petsc::options::set("ksp_type", "cg"); la::petsc::options::set("pc_type", "jacobi"); solver3.set_from_options();
+        la::petsc::options::set("ksp_type", "bcgs"); la::petsc::options::set("pc_type", "jacobi"); solver3.set_from_options();
 
-        // Главный цикл по времени
+        // подготавливаем вектора для решения СЛАУ
         la::Vector<T> b1(L1.function_spaces()[0]->dofmap()->index_map, L1.function_spaces()[0]->dofmap()->index_map_bs());
         la::Vector<T> b2(L2.function_spaces()[0]->dofmap()->index_map, L2.function_spaces()[0]->dofmap()->index_map_bs());
         la::Vector<T> b3(L3.function_spaces()[0]->dofmap()->index_map, L3.function_spaces()[0]->dofmap()->index_map_bs());
-
+        // правильные типы с правильной памятью для решателя
         la::petsc::Vector _us(la::petsc::create_vector_wrap(*u_s->x()), false);
         la::petsc::Vector _ps(la::petsc::create_vector_wrap(*p_s->x()), false);
         la::petsc::Vector _unext(la::petsc::create_vector_wrap(*u_next->x()), false);
-
-        int num_steps = 100;
+        // количество шагов
+        int num_steps = 50;
         std::cout << "Начинаем расчет CFD (Метод Чорина)..." << std::endl;
 
-        // Задаем имена функциям (это важно для ParaView)
+        // задаем имена функциям (это важно для ParaView)
         // u_n->name = "Velocity";
         // p_n->name = "Pressure";
 
-        // Создаем файл для записи (режим "w" - перезапись)
+        // создаем файл для записи
         io::XDMFFile file_out(MPI_COMM_WORLD, "results.xdmf", "w");
         file_out.write_mesh(*mesh);
         
-        // Записываем начальные условия (t = 0)
-        u_vis->interpolate(*u_n); // Интерполируем P2 -> P1
+        // записываем начальные условия (t = 0)
+        u_vis->interpolate(*u_n); // интерполируем P2 -> P1 - делаем из парабол то, что схавает паравиев
         file_out.write_function(*u_vis, 0.0);
         file_out.write_function(*p_n, 0.0);
 
         for (int step = 1; step <= num_steps; ++step) {
             double t = step * dt->value[0];
+            // пересобираем матрицу А1 (остальные можно не пересобирать они константы - они геометрические)
             MatZeroEntries(A1.mat());
             fem::assemble_matrix(la::petsc::Matrix::set_block_fn(A1.mat(), ADD_VALUES), a1, {bc_inlet, bc_noslip});
             MatAssemblyBegin(A1.mat(), MAT_FLUSH_ASSEMBLY); 
@@ -220,18 +229,17 @@ int main(int argc, char* argv[])
             MatAssemblyBegin(A1.mat(), MAT_FINAL_ASSEMBLY); 
             MatAssemblyEnd(A1.mat(), MAT_FINAL_ASSEMBLY);
             // ШАГ 1
-            std::ranges::fill(b1.array(), 0.0);
-            fem::assemble_vector(b1.array(), L1);
-            // ИСПРАВЛЕНИЕ: Убрали <T, U>, используем автовывод типов (как в elasticity.cpp)
-            fem::apply_lifting(b1.array(), {a1}, {{bc_inlet, bc_noslip}}, {}, T(-1));
-            b1.scatter_rev(std::plus<T>());
+            std::ranges::fill(b1.array(), 0.0); // очищаем старый вектор
+            fem::assemble_vector(b1.array(), L1); // L1 вычисляем
+            fem::apply_lifting(b1.array(), {a1}, {{bc_inlet, bc_noslip}}, {}, T(-1)); // применение граничных условий, но как-то хитро - надо разобраться
+            b1.scatter_rev(std::plus<T>()); // синхронизируем для многопоточности
             bc_inlet.set(b1.array(), std::nullopt);
             bc_noslip.set(b1.array(), std::nullopt);
             
             la::petsc::Vector _b1(la::petsc::create_vector_wrap(b1), false);
-            solver1.solve(_us.vec(), _b1.vec());
-            u_s->x()->scatter_fwd();
-
+            solver1.solve(_us.vec(), _b1.vec()); // решаем
+            u_s->x()->scatter_fwd(); // делимся с остальными решателями (ну когда многопоток)
+            // дебаговый вывод, чтобы понять улетает ли солвер в 0 или бесконечность
             if (step == 1) {
                 double norm_b1, norm_us;
                 VecNorm(_b1.vec(), NORM_2, &norm_b1);  // Проверяем правую часть (должна быть > 0)
@@ -249,7 +257,6 @@ int main(int argc, char* argv[])
             // ШАГ 2
             std::ranges::fill(b2.array(), 0.0);
             fem::assemble_vector(b2.array(), L2);
-            // ИСПРАВЛЕНИЕ: Убрали <T, U>
             fem::apply_lifting(b2.array(), {a2}, {{bc_outlet}}, {}, T(-1));
             b2.scatter_rev(std::plus<T>());
             bc_outlet.set(b2.array(), std::nullopt);
@@ -261,7 +268,6 @@ int main(int argc, char* argv[])
             // ШАГ 3
             std::ranges::fill(b3.array(), 0.0);
             fem::assemble_vector(b3.array(), L3);
-            // ИСПРАВЛЕНИЕ: Убрали <T, U>
             fem::apply_lifting(b3.array(), {a3}, {{bc_inlet, bc_noslip}}, {}, T(-1));
             b3.scatter_rev(std::plus<T>());
             bc_inlet.set(b3.array(), std::nullopt);
@@ -271,19 +277,18 @@ int main(int argc, char* argv[])
             solver3.solve(_unext.vec(), _b3.vec());
             u_next->x()->scatter_fwd();
 
+            // сохраняем результаты шага и переходим к следующему
             std::ranges::copy(u_next->x()->array(), u_n->x()->array().begin());
             std::ranges::copy(p_s->x()->array(), p_n->x()->array().begin());
 
             u_n->x()->scatter_fwd();
             p_n->x()->scatter_fwd();
-
+            // интерполируем для записи и визуализации
             u_vis->interpolate(*u_n);
             file_out.write_function(*u_vis, t);
             file_out.write_function(*p_n, t);
             
             std::cout << "Шаг времени: " << step << "/" << num_steps << " (t = " << t << ")" << std::endl;
-
-            // Обновление переменных
         }
         file_out.close();
         

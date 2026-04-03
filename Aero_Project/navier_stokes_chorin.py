@@ -15,7 +15,7 @@ e_q = element("Lagrange", "tetrahedron", 1)
 V = FunctionSpace(mesh, e_v)
 Q = FunctionSpace(mesh, e_q)
 
-# Искомые функции для левых частей (Trial)
+# Искомые функции
 u = TrialFunction(V)
 p = TrialFunction(Q)
 
@@ -23,13 +23,13 @@ p = TrialFunction(Q)
 v = TestFunction(V)
 q = TestFunction(Q)
 
-# Коэффициенты для правых частей (Known)
+# Коэффициенты для правых частей
 u_n = Coefficient(V)      # Скорость на шаге n
 u_s = Coefficient(V)      # Предварительная скорость u* (результат Шага 1)
 p_n = Coefficient(Q)      # Давление на шаге n
 p_s = Coefficient(Q)      # Давление на шаге n+1 (результат Шага 2)
 
-dt = Constant(mesh)
+dt = Constant(mesh)       # Шаг по времени
 rho = Constant(mesh)      # Плотность
 mu = Constant(mesh)       # Динамическая вязкость
 
