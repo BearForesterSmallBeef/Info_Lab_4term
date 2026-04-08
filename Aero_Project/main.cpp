@@ -14,6 +14,7 @@
 #include <map>
 #include <algorithm>
 #include <optional>
+#include <fstream>
 
 using namespace dolfinx;
 using T = PetscScalar;
@@ -23,6 +24,18 @@ int main(int argc, char* argv[])
 {
     dolfinx::init_logging(argc, argv);
     PetscInitialize(&argc, &argv, nullptr, nullptr);
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    std::ofstream log_file;
+    std::streambuf* original_cout_buf = std::cout.rdbuf(); // сохраняем оригинальный вывод в консоль
+
+    if (rank == 0) {
+        log_file.open("log.txt", std::ios::out);
+        // перенаправляем std::cout в наш файл log.txt
+        std::cout.rdbuf(log_file.rdbuf()); 
+        std::cout << "=== НАЧАЛО РАСЧЕТА CFD ===" << std::endl;
+    }
 
     {
         fem::CoordinateElement<U> cmap(mesh::CellType::tetrahedron, 1);
@@ -68,7 +81,7 @@ int main(int argc, char* argv[])
         auto p_n = std::make_shared<fem::Function<T>>(Q);
         auto p_s = std::make_shared<fem::Function<T>>(Q);
         // задаем константы
-        auto dt = std::make_shared<fem::Constant<T>>(0.003);
+        auto dt = std::make_shared<fem::Constant<T>>(0.0001);
         auto rho = std::make_shared<fem::Constant<T>>(1.0); // Плотность воздуха, кг/м^3
         auto mu = std::make_shared<fem::Constant<T>>(0.05);
         // костыль - мы создаем доп пространство для сохранения скоростей для визуализации, тк паравиев с параболами дружить отказался 
@@ -84,6 +97,15 @@ int main(int argc, char* argv[])
         p_n->name = "Pressure"; 
 
         // граничные условия
+        /*
+        auto u_inlet = std::make_shared<fem::Function<T>>(V);
+        u_inlet->interpolate([](auto x) -> std::pair<std::vector<T>, std::vector<std::size_t>> {
+            std::size_t N = x.extent(1);
+            std::vector<T> v(3 * N, 0.0);
+            for (std::size_t i = 0; i < N; ++i) v[0 * N + i] = 1.0; 
+            return {v, {3, N}};
+        });
+        */
         auto u_inlet = std::make_shared<fem::Function<T>>(V);
         u_inlet->interpolate([](auto x) -> std::pair<std::vector<T>, std::vector<std::size_t>> {
             std::size_t N = x.extent(1);
@@ -103,6 +125,7 @@ int main(int argc, char* argv[])
             }
             return {v, {3, N}};
         });
+        
         auto inlet_dofs = fem::locate_dofs_topological(*V->mesh()->topology_mutable(), *V->dofmap(), 2, facet_tags.find(1));
         fem::DirichletBC<T> bc_inlet(u_inlet, inlet_dofs);
         
@@ -177,6 +200,34 @@ int main(int argc, char* argv[])
         MatAssemblyBegin(A3.mat(), MAT_FLUSH_ASSEMBLY); MatAssemblyEnd(A3.mat(), MAT_FLUSH_ASSEMBLY);
         fem::set_diagonal<T>(la::petsc::Matrix::set_fn(A3.mat(), INSERT_VALUES), *V, {bc_inlet, bc_noslip});
         MatAssemblyBegin(A3.mat(), MAT_FINAL_ASSEMBLY); MatAssemblyEnd(A3.mat(), MAT_FINAL_ASSEMBLY);
+
+        std::vector<std::int32_t> sphere_facets_indices = facet_tags.find(4);
+
+        // 2. Вычисляем домены интегрирования (пары: индекс_ячейки, локальный_индекс_грани)
+        std::vector<std::int32_t> integration_entities = dolfinx::fem::compute_integration_domains(
+            dolfinx::fem::IntegralType::exterior_facet,
+            *mesh->topology(),
+            sphere_facets_indices
+        );
+
+        // 3. Формируем map в том виде, в котором его жестко требует компилятор
+        std::map<dolfinx::fem::IntegralType, std::vector<std::pair<std::int32_t, std::span<const std::int32_t>>>> subdomains = {
+            {
+                dolfinx::fem::IntegralType::exterior_facet, 
+                { {4, std::span<const std::int32_t>(integration_entities)} }
+            }
+        };
+
+        // 4. Создаем форму
+        fem::Form<T> drag_form = fem::create_form<T>(
+            *form_navier_stokes_chorin_drag_force, 
+            {},           // Пусто, так как нет пространств тестовых/пробных функций
+            coeffs,       // Передаем u_n и p_n
+            consts,       // Передаем mu
+            subdomains,   // Теперь тип совпадает идеально!
+            {}, 
+            mesh_const
+        );
         // настройки солеверов
         // матрица A1 несимметрична из-за конвекции
         // поэтому используем "bcgs" (BiCGSTAB — метод бисопряженных градиентов со стабилизацией)
@@ -202,7 +253,7 @@ int main(int argc, char* argv[])
         la::petsc::Vector _ps(la::petsc::create_vector_wrap(*p_s->x()), false);
         la::petsc::Vector _unext(la::petsc::create_vector_wrap(*u_next->x()), false);
         // количество шагов
-        int num_steps = 50;
+        int num_steps = 1000;
         std::cout << "Начинаем расчет CFD (Метод Чорина)..." << std::endl;
 
         // задаем имена функциям (это важно для ParaView)
@@ -231,7 +282,7 @@ int main(int argc, char* argv[])
             // ШАГ 1
             std::ranges::fill(b1.array(), 0.0); // очищаем старый вектор
             fem::assemble_vector(b1.array(), L1); // L1 вычисляем
-            fem::apply_lifting(b1.array(), {a1}, {{bc_inlet, bc_noslip}}, {}, T(-1)); // применение граничных условий, но как-то хитро - надо разобраться
+            fem::apply_lifting(b1.array(), {a1}, {{bc_inlet, bc_noslip}}, {}, T(1)); // применение граничных условий, но как-то хитро - надо разобраться
             b1.scatter_rev(std::plus<T>()); // синхронизируем для многопоточности
             bc_inlet.set(b1.array(), std::nullopt);
             bc_noslip.set(b1.array(), std::nullopt);
@@ -240,13 +291,11 @@ int main(int argc, char* argv[])
             solver1.solve(_us.vec(), _b1.vec()); // решаем
             u_s->x()->scatter_fwd(); // делимся с остальными решателями (ну когда многопоток)
             // дебаговый вывод, чтобы понять улетает ли солвер в 0 или бесконечность
-            if (step == 1) {
+            if (step % 10 == 1) {
                 double norm_b1, norm_us;
                 VecNorm(_b1.vec(), NORM_2, &norm_b1);  // Проверяем правую часть (должна быть > 0)
                 VecNorm(_us.vec(), NORM_2, &norm_us);  // Проверяем решение (должно быть > 0)
     
-                int rank;
-                MPI_Comm_rank(MPI_COMM_WORLD, &rank);
                 if (rank == 0) {
                 std::cout << "--- ШАГ 1 ДЕБАГ ---" << std::endl;
                 std::cout << "Норма вектора правой части (b1): " << norm_b1 << std::endl;
@@ -257,7 +306,7 @@ int main(int argc, char* argv[])
             // ШАГ 2
             std::ranges::fill(b2.array(), 0.0);
             fem::assemble_vector(b2.array(), L2);
-            fem::apply_lifting(b2.array(), {a2}, {{bc_outlet}}, {}, T(-1));
+            fem::apply_lifting(b2.array(), {a2}, {{bc_outlet}}, {}, T(1));
             b2.scatter_rev(std::plus<T>());
             bc_outlet.set(b2.array(), std::nullopt);
             
@@ -268,7 +317,7 @@ int main(int argc, char* argv[])
             // ШАГ 3
             std::ranges::fill(b3.array(), 0.0);
             fem::assemble_vector(b3.array(), L3);
-            fem::apply_lifting(b3.array(), {a3}, {{bc_inlet, bc_noslip}}, {}, T(-1));
+            fem::apply_lifting(b3.array(), {a3}, {{bc_inlet, bc_noslip}}, {}, T(1));
             b3.scatter_rev(std::plus<T>());
             bc_inlet.set(b3.array(), std::nullopt);
             bc_noslip.set(b3.array(), std::nullopt);
@@ -287,14 +336,29 @@ int main(int argc, char* argv[])
             u_vis->interpolate(*u_n);
             file_out.write_function(*u_vis, t);
             file_out.write_function(*p_n, t);
+            T local_drag = fem::assemble_scalar(drag_form);
             
-            std::cout << "Шаг времени: " << step << "/" << num_steps << " (t = " << t << ")" << std::endl;
+            // мы считаем на нескольких ядрах, нужно сложить кусочки
+            double local_drag_val = std::real(local_drag); // приводим к double на всякий случай, иначе говно какое-то
+            double total_drag = 0.0;
+            MPI_Reduce(&local_drag_val, &total_drag, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
+            if (rank == 0) {
+                std::cout << "Шаг времени: " << step << "/" << num_steps << " (t = " << t << ")" << std::endl;
+                std::cout << "Лобовое сопротивление (Drag): " << total_drag << " Н" << std::endl;
+                std::cout << "------------------------------------------------" << std::endl;
+            }
         }
         file_out.close();
-        
         std::cout << "Расчет успешно завершен!" << std::endl;
     }
 
+    // возвращаем стандартный вывод обратно в консоль и закрываем файл
+    if (rank == 0) {
+        std::cout.rdbuf(original_cout_buf);
+        log_file.close();
+        std::cout << "Логи успешно сохранены в log.txt" << std::endl;
+    }
     PetscFinalize();
     return 0;
 }
